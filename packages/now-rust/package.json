@@ -1,15 +1,18 @@
 {
   "name": "@now/rust",
-  "version": "0.0.5",
+  "version": "0.2.0",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/zeit/now-builders.git",
     "directory": "packages/now-rust"
   },
+  "scripts": {
+    "test": "jest"
+  },
   "files": [
     "index.js",
-    "download-install-rust-toolchain.js",
+    "install-rust.js",
     "launcher.rs"
   ],
   "dependencies": {

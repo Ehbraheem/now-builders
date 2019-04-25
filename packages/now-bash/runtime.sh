@@ -1,3 +1,4 @@
+#!/bin/bash
 import "static-binaries@1.0.0"
 static_binaries jq
 
@@ -13,12 +14,14 @@ _lambda_runtime_api() {
 
 _lambda_runtime_init() {
 	# Initialize user code
+	# shellcheck disable=SC1090
 	. "$SCRIPT_FILENAME" || {
 		local exit_code="$?"
-		local error
-		error='{"exitCode":'"$exit_code"'}'
+		local error_message="Initialization failed for '$SCRIPT_FILENAME' (exit code $exit_code)"
+		echo "$error_message" >&2
+		local error='{"errorMessage":"'"$error_message"'"}'
 		_lambda_runtime_api "init/error" -X POST -d "$error"
-		exit "$EXIT_CODE"
+		exit "$exit_code"
 	}
 
 	# Process events
@@ -45,18 +48,17 @@ _lambda_runtime_next() {
 	local body
 	body="$(mktemp)"
 
-	local exit_code=0
-	REQUEST="$event"
-
 	# Stdin of the `handler` function is the HTTP request body.
 	# Need to use a fifo here instead of bash <() because Lambda
 	# errors with "/dev/fd/63 not found" for some reason :/
 	local stdin
 	stdin="$(mktemp -u)"
 	mkfifo "$stdin"
-	_lambda_runtime_body "$event" > "$stdin" &
+	_lambda_runtime_body < "$event" > "$stdin" &
 
+	local exit_code=0
 	handler "$event" < "$stdin" > "$body" || exit_code="$?"
+
 	rm -f "$event" "$stdin"
 
 	if [ "$exit_code" -eq 0 ]; then
@@ -68,18 +70,21 @@ _lambda_runtime_next() {
 			| _lambda_runtime_api "invocation/$request_id/response" -X POST -d @- > /dev/null
 		rm -f "$body" "$_HEADERS"
 	else
-		echo "\`handler\` function return code: $exit_code"
-		_lambda_runtime_api "invocation/$request_id/error" -X POST -d @- > /dev/null <<< '{"exitCode":'"$exit_code"'}'
+		local error_message="Invocation failed for 'handler' function in '$SCRIPT_FILENAME' (exit code $exit_code)"
+		echo "$error_message" >&2
+		_lambda_runtime_api "invocation/$request_id/error" -X POST -d '{"errorMessage":"'"$error_message"'"}' > /dev/null
 	fi
 }
 
 _lambda_runtime_body() {
-	if [ "$(jq --raw-output '.body | type' < "$1")" = "string" ]; then
-		if [ "$(jq --raw-output '.encoding' < "$1")" = "base64" ]; then
-			jq --raw-output '.body' < "$1" | base64 --decode
+	local event
+	event="$(cat)"
+	if [ "$(jq --raw-output '.body | type' <<< "$event")" = "string" ]; then
+		if [ "$(jq --raw-output '.encoding' <<< "$event")" = "base64" ]; then
+			jq --raw-output '.body' <<< "$event" | base64 --decode
 		else
 			# assume plain-text body
-			jq --raw-output '.body' < "$1"
+			jq --raw-output '.body' <<< "$event"
 		fi
 	fi
 }
@@ -97,7 +102,10 @@ http_response_header() {
 	local value="$2"
 	local tmp
 	tmp="$(mktemp)"
-	jq --arg name "$name" --arg value "$value" '.[$name] = $value' < "$_HEADERS" > "$tmp"
+	jq \
+		--arg name "$name" \
+		--arg value "$value" \
+		'.[$name] = $value' < "$_HEADERS" > "$tmp"
 	mv -f "$tmp" "$_HEADERS"
 }
 

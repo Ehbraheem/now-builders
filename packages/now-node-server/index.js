@@ -5,7 +5,6 @@ const FileFsRef = require('@now/build-utils/file-fs-ref.js'); // eslint-disable-
 const fs = require('fs-extra');
 const glob = require('@now/build-utils/fs/glob.js'); // eslint-disable-line import/no-extraneous-dependencies
 const path = require('path');
-const rename = require('@now/build-utils/fs/rename.js'); // eslint-disable-line import/no-extraneous-dependencies
 const {
   runNpmInstall,
   runPackageJsonScript,
@@ -31,52 +30,56 @@ async function downloadInstallAndBundle(
   { files, entrypoint, workPath },
   { npmArguments = [] } = {},
 ) {
-  const userPath = path.join(workPath, 'user');
-  const nccPath = path.join(workPath, 'ncc');
-
   console.log('downloading user files...');
-  const downloadedFiles = await download(files, userPath);
+  const downloadedFiles = await download(files, workPath);
 
   console.log("installing dependencies for user's code...");
-  const entrypointFsDirname = path.join(userPath, path.dirname(entrypoint));
+  const entrypointFsDirname = path.join(workPath, path.dirname(entrypoint));
   await runNpmInstall(entrypointFsDirname, npmArguments);
-
-  console.log('writing ncc package.json...');
-  await download(
-    {
-      'package.json': new FileBlob({
-        data: JSON.stringify({
-          license: 'UNLICENSED',
-          dependencies: {
-            '@zeit/ncc': '0.15.2',
-          },
-        }),
-      }),
-    },
-    nccPath,
-  );
-
-  console.log('installing dependencies for ncc...');
-  await runNpmInstall(nccPath, npmArguments);
-  return [downloadedFiles, userPath, nccPath, entrypointFsDirname];
+  return [downloadedFiles, entrypointFsDirname];
 }
 
-async function compile(workNccPath, downloadedFiles, entrypoint) {
+async function compile(workPath, downloadedFiles, entrypoint, config) {
   const input = downloadedFiles[entrypoint].fsPath;
-  const ncc = require(path.join(workNccPath, 'node_modules/@zeit/ncc'));
-  const { code, assets } = await ncc(input, { sourceMap: true });
+  const inputDir = path.dirname(input);
+  const ncc = require('@zeit/ncc');
+  const { code, map, assets } = await ncc(input, {
+    sourceMap: true,
+    sourceMapRegister: true,
+  });
+
+  if (config && config.includeFiles) {
+    // eslint-disable-next-line no-restricted-syntax
+    for (const pattern of config.includeFiles) {
+      // eslint-disable-next-line no-await-in-loop
+      const files = await glob(pattern, inputDir);
+
+      // eslint-disable-next-line no-restricted-syntax
+      for (const assetName of Object.keys(files)) {
+        const stream = files[assetName].toStream();
+        const { mode } = files[assetName];
+        // eslint-disable-next-line no-await-in-loop
+        const { data } = await FileBlob.fromStream({ stream });
+
+        assets[assetName] = {
+          source: data,
+          permissions: mode,
+        };
+      }
+    }
+  }
 
   const preparedFiles = {};
-  const blob = new FileBlob({ data: code });
   // move all user code to 'user' subdirectory
-  preparedFiles[path.join('user', entrypoint)] = blob;
+  preparedFiles[entrypoint] = new FileBlob({ data: code });
+  preparedFiles[`${entrypoint.replace('.ts', '.js')}.map`] = new FileBlob({
+    data: map,
+  });
   // eslint-disable-next-line no-restricted-syntax
   for (const assetName of Object.keys(assets)) {
     const { source: data, permissions: mode } = assets[assetName];
     const blob2 = new FileBlob({ data, mode });
-    preparedFiles[
-      path.join('user', path.dirname(entrypoint), assetName)
-    ] = blob2;
+    preparedFiles[path.join(path.dirname(entrypoint), assetName)] = blob2;
   }
 
   return preparedFiles;
@@ -93,12 +96,7 @@ exports.config = {
 exports.build = async ({
   files, entrypoint, config, workPath,
 }) => {
-  const [
-    downloadedFiles,
-    workUserPath,
-    workNccPath,
-    entrypointFsDirname,
-  ] = await downloadInstallAndBundle(
+  const [downloadedFiles, entrypointFsDirname] = await downloadInstallAndBundle(
     { files, entrypoint, workPath },
     { npmArguments: ['--prefer-offline'] },
   );
@@ -110,22 +108,22 @@ exports.build = async ({
   let preparedFiles;
 
   if (config && config.bundle === false) {
-    // move all user code to 'user' subdirectory
-    preparedFiles = await glob('**', workUserPath);
-    preparedFiles = rename(preparedFiles, name => path.join('user', name));
+    preparedFiles = await glob('**', workPath);
   } else {
     console.log('compiling entrypoint with ncc...');
-    preparedFiles = await compile(workNccPath, downloadedFiles, entrypoint);
+    preparedFiles = await compile(
+      workPath,
+      downloadedFiles,
+      entrypoint,
+      config,
+    );
   }
 
   const launcherPath = path.join(__dirname, 'launcher.js');
   let launcherData = await fs.readFile(launcherPath, 'utf8');
   launcherData = launcherData.replace(
     '// PLACEHOLDER',
-    [
-      'process.chdir("./user");',
-      `require("./${path.join('user', entrypoint)}");`,
-    ].join(' '),
+    [`require("./${entrypoint}");`].join(' '),
   );
 
   const launcherFiles = {
@@ -142,18 +140,8 @@ exports.build = async ({
   return { [entrypoint]: lambda };
 };
 
-exports.prepareCache = async ({
-  files, entrypoint, workPath, cachePath,
-}) => {
-  await fs.remove(workPath);
-  await downloadInstallAndBundle({ files, entrypoint, workPath: cachePath });
-
-  return {
-    ...(await glob('user/node_modules/**', cachePath)),
-    ...(await glob('user/package-lock.json', cachePath)),
-    ...(await glob('user/yarn.lock', cachePath)),
-    ...(await glob('ncc/node_modules/**', cachePath)),
-    ...(await glob('ncc/package-lock.json', cachePath)),
-    ...(await glob('ncc/yarn.lock', cachePath)),
-  };
-};
+exports.prepareCache = async ({ workPath }) => ({
+  ...(await glob('node_modules/**', workPath)),
+  ...(await glob('package-lock.json', workPath)),
+  ...(await glob('yarn.lock', workPath)),
+});

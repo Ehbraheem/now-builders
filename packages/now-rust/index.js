@@ -7,11 +7,19 @@ const download = require('@now/build-utils/fs/download.js'); // eslint-disable-l
 const glob = require('@now/build-utils/fs/glob.js'); // eslint-disable-line import/no-extraneous-dependencies
 const { runShellScript } = require('@now/build-utils/fs/run-user-scripts.js'); // eslint-disable-line import/no-extraneous-dependencies
 const FileFsRef = require('@now/build-utils/file-fs-ref.js'); // eslint-disable-line import/no-extraneous-dependencies
-const installRustAndGCC = require('./download-install-rust-toolchain.js');
+const FileRef = require('@now/build-utils/file-ref.js'); // eslint-disable-line import/no-extraneous-dependencies
+const installRust = require('./install-rust.js');
 
 exports.config = {
   maxLambdaSize: '25mb',
 };
+
+const codegenFlags = [
+  '-C',
+  'target-cpu=ivybridge',
+  '-C',
+  'target-feature=-aes,-avx,+fxsr,-popcnt,+sse,+sse2,-sse3,-sse4.1,-sse4.2,-ssse3,-xsave,-xsaveopt',
+];
 
 async function inferCargoBinaries(config) {
   try {
@@ -39,6 +47,7 @@ async function parseTOMLStream(stream) {
 async function buildWholeProject({
   entrypoint,
   downloadedFiles,
+  extraFiles,
   rustEnv,
   config,
 }) {
@@ -46,11 +55,15 @@ async function buildWholeProject({
   const { debug } = config;
   console.log('running `cargo build`...');
   try {
-    await execa('cargo', ['build'].concat(debug ? [] : ['--release']), {
-      env: rustEnv,
-      cwd: entrypointDirname,
-      stdio: 'inherit',
-    });
+    await execa(
+      'cargo',
+      ['build', '--verbose'].concat(debug ? [] : ['--release']),
+      {
+        env: rustEnv,
+        cwd: entrypointDirname,
+        stdio: 'inherit',
+      },
+    );
   } catch (err) {
     console.error('failed to `cargo build`');
     throw err;
@@ -73,6 +86,7 @@ async function buildWholeProject({
       const fsPath = path.join(targetPath, binary);
       const lambda = await createLambda({
         files: {
+          ...extraFiles,
           bootstrap: new FileFsRef({ mode: 0o755, fsPath }),
         },
         handler: 'bootstrap',
@@ -86,8 +100,27 @@ async function buildWholeProject({
   return lambdas;
 }
 
+async function gatherExtraFiles(globMatcher, entrypoint) {
+  if (!globMatcher) return {};
+
+  console.log('gathering extra files for the fs...');
+
+  const entryDir = path.dirname(entrypoint);
+
+  if (Array.isArray(globMatcher)) {
+    const allMatches = await Promise.all(
+      globMatcher.map(pattern => glob(pattern, entryDir)),
+    );
+
+    return allMatches.reduce((acc, matches) => ({ ...acc, ...matches }), {});
+  }
+
+  return glob(globMatcher, entryDir);
+}
+
 async function runUserScripts(entrypoint) {
-  const buildScriptPath = path.join(entrypoint, 'build.sh');
+  const entryDir = path.dirname(entrypoint);
+  const buildScriptPath = path.join(entryDir, 'build.sh');
   const buildScriptExists = await fs.exists(buildScriptPath);
 
   if (buildScriptExists) {
@@ -121,6 +154,7 @@ async function buildSingleFile({
   workPath,
   entrypoint,
   downloadedFiles,
+  extraFiles,
   rustEnv,
   config,
 }) {
@@ -182,7 +216,9 @@ async function buildSingleFile({
   try {
     await execa(
       'cargo',
-      ['build', '--bin', binName].concat(debug ? [] : ['--release']),
+      ['build', '--bin', binName, '--verbose'].concat(
+        debug ? [] : ['--release'],
+      ),
       {
         env: rustEnv,
         cwd: entrypointDirname,
@@ -203,6 +239,7 @@ async function buildSingleFile({
 
   const lambda = await createLambda({
     files: {
+      ...extraFiles,
       bootstrap: new FileFsRef({ mode: 0o755, fsPath: bin }),
     },
     handler: 'bootstrap',
@@ -215,21 +252,27 @@ async function buildSingleFile({
 }
 
 exports.build = async (m) => {
-  const { files, entrypoint, workPath } = m;
+  const {
+    files, entrypoint, workPath, config,
+  } = m;
   console.log('downloading files');
   const downloadedFiles = await download(files, workPath);
+  const entryPath = downloadedFiles[entrypoint].fsPath;
 
-  const { PATH: toolchainPath, ...otherEnv } = await installRustAndGCC();
+  await installRust();
   const { PATH, HOME } = process.env;
   const rustEnv = {
     ...process.env,
-    ...otherEnv,
-    PATH: `${path.join(HOME, '.cargo/bin')}:${toolchainPath}:${PATH}`,
+    PATH: `${path.join(HOME, '.cargo/bin')}:${PATH}`,
+    RUSTFLAGS: [process.env.RUSTFLAGS, ...codegenFlags]
+      .filter(Boolean)
+      .join(' '),
   };
 
-  await runUserScripts(entrypoint);
+  await runUserScripts(entryPath);
+  const extraFiles = await gatherExtraFiles(config.includeFiles, entryPath);
 
-  const newM = Object.assign(m, { downloadedFiles, rustEnv });
+  const newM = Object.assign(m, { downloadedFiles, extraFiles, rustEnv });
   if (path.extname(entrypoint) === '.toml') {
     return buildWholeProject(newM);
   }
@@ -247,6 +290,9 @@ exports.prepareCache = async ({ cachePath, entrypoint, workPath }) => {
     const rustEnv = {
       ...process.env,
       PATH: `${path.join(HOME, '.cargo/bin')}:${PATH}`,
+      RUSTFLAGS: [process.env.RUSTFLAGS, ...codegenFlags]
+        .filter(Boolean)
+        .join(' '),
     };
     const entrypointDirname = path.dirname(path.join(workPath, entrypoint));
     const cargoTomlFile = await cargoLocateProject({
@@ -277,7 +323,47 @@ exports.prepareCache = async ({ cachePath, entrypoint, workPath }) => {
     path.join(cacheEntrypointDirname, 'target'),
   );
 
-  return {
-    ...(await glob('**/**', path.join(cachePath))),
-  };
+  const cacheFiles = await glob('**/**', cachePath);
+
+  // eslint-disable-next-line no-restricted-syntax
+  for (const f of Object.keys(cacheFiles)) {
+    const accept = /(?:^|\/)target\/release\/\.fingerprint\//.test(f)
+      || /(?:^|\/)target\/release\/build\//.test(f)
+      || /(?:^|\/)target\/release\/deps\//.test(f)
+      || /(?:^|\/)target\/debug\/\.fingerprint\//.test(f)
+      || /(?:^|\/)target\/debug\/build\//.test(f)
+      || /(?:^|\/)target\/debug\/deps\//.test(f);
+    if (!accept) {
+      delete cacheFiles[f];
+    }
+  }
+
+  return cacheFiles;
+};
+
+function findCargoToml(files, entrypoint) {
+  let currentPath = path.dirname(entrypoint);
+  let cargoTomlPath;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    cargoTomlPath = path.join(currentPath, 'Cargo.toml');
+    if (files[cargoTomlPath]) break;
+    const newPath = path.dirname(currentPath);
+    if (currentPath === newPath) break;
+    currentPath = newPath;
+  }
+
+  return cargoTomlPath;
+}
+
+exports.getDefaultCache = ({ files, entrypoint }) => {
+  const cargoTomlPath = findCargoToml(files, entrypoint);
+  if (!cargoTomlPath) return undefined;
+  const targetFolderDir = path.dirname(cargoTomlPath);
+  const defaultCacheRef = new FileRef({
+    digest:
+      'sha:204e0c840c43473bbd130d7bc704fe5588b4eab43cda9bc940f10b2a0ae14b16',
+  });
+  return { [targetFolderDir]: defaultCacheRef };
 };

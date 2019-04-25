@@ -20,7 +20,12 @@ async function nowDeploy (bodies, randomness) {
     version: 2,
     public: true,
     env: { ...nowJson.env, RANDOMNESS_ENV_VAR: randomness },
-    build: { env: { ...(nowJson.build || {}).env, RANDOMNESS_BUILD_ENV_VAR: randomness } },
+    build: {
+      env: {
+        ...(nowJson.build || {}).env,
+        RANDOMNESS_BUILD_ENV_VAR: randomness
+      }
+    },
     name: 'test',
     files,
     builds: nowJson.builds,
@@ -31,10 +36,7 @@ async function nowDeploy (bodies, randomness) {
   console.log(`posting ${files.length} files`);
 
   for (const { file: filename } of files) {
-    await filePost(
-      bodies[filename],
-      digestOfFile(bodies[filename])
-    );
+    await filePost(bodies[filename], digestOfFile(bodies[filename]));
   }
 
   let deploymentId;
@@ -94,6 +96,8 @@ async function deploymentPost (payload) {
     method: 'POST',
     body: JSON.stringify(payload)
   });
+
+  console.log(`fetch status: ${resp.status} ${resp.statusText}`);
   const json = await resp.json();
 
   if (json.error) {
@@ -109,20 +113,21 @@ async function deploymentGet (deploymentId) {
 }
 
 let token;
+let currentCount = 0;
+const MAX_COUNT = 10;
 
 async function fetchWithAuth (url, opts = {}) {
   if (!opts.headers) opts.headers = {};
 
   if (!opts.headers.Authorization) {
-    if (!token) {
-      const { NOW_TOKEN, NOW_TOKEN_FACTORY_URL } = process.env;
-
+    const { NOW_TOKEN, NOW_TOKEN_FACTORY_URL } = process.env;
+    currentCount += 1;
+    if (!token || currentCount === MAX_COUNT) {
+      currentCount = 0;
       if (NOW_TOKEN) {
         token = NOW_TOKEN;
-      } else
-      if (NOW_TOKEN_FACTORY_URL) {
-        const resp = await fetch(NOW_TOKEN_FACTORY_URL);
-        token = (await resp.json()).token;
+      } else if (NOW_TOKEN_FACTORY_URL) {
+        token = await fetchTokenWithRetry(NOW_TOKEN_FACTORY_URL);
       } else {
         const authJsonPath = path.join(homedir(), '.now/auth.json');
         token = require(authJsonPath).token;
@@ -133,6 +138,27 @@ async function fetchWithAuth (url, opts = {}) {
   }
 
   return await fetchApi(url, opts);
+}
+
+function fetchTokenWithRetry (url, retries = 3) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      resolve(data.token);
+    } catch (error) {
+      console.log(`Failed to fetch token. Retries remaining: ${retries}`);
+      if (retries === 0) {
+        reject(error);
+        return;
+      }
+      setTimeout(() => {
+        fetchTokenWithRetry(url, retries - 1)
+          .then(resolve)
+          .catch(reject);
+      }, 500);
+    }
+  });
 }
 
 async function fetchApi (url, opts = {}) {
@@ -150,6 +176,8 @@ async function fetchApi (url, opts = {}) {
   if (!opts.headers.Accept) {
     opts.headers.Accept = 'application/json';
   }
+
+  opts.headers['x-now-trace-priority'] = '1';
 
   return await fetch(urlWithHost, opts);
 }
